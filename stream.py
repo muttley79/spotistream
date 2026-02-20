@@ -26,6 +26,8 @@ Usage:
 """
 
 import asyncio
+import collections
+import itertools
 import logging
 import logging.handlers
 import os
@@ -33,6 +35,7 @@ import random
 import subprocess
 import sys
 import threading
+import time
 from functools import partial
 
 import spotipy
@@ -71,6 +74,7 @@ LIBRESPOT_BIN: str    = LB_CFG.get("path", "") or "librespot"
 FFMPEG_BIN: str       = FF_CFG.get("path", "") or "ffmpeg"
 INITIAL_VOLUME: int   = int(LB_CFG.get("initial_volume", 100))
 SCOPES = "user-modify-playback-state user-read-playback-state streaming"
+BUFFER_SECS: float = float(SRV_CFG.get("buffer_secs", 10.0))
 
 
 def _add_file_handler() -> None:
@@ -87,11 +91,24 @@ def _add_file_handler() -> None:
 
 _add_file_handler()
 
+# Must match the -b:a value in build_ffmpeg_cmd()
+_OUTPUT_BITRATE_KBPS: int = 192
+_OUTPUT_BYTES_PER_SEC: int = _OUTPUT_BITRATE_KBPS * 1000 // 8  # 24 000
+
+# broadcaster reads 8192-byte chunks → ~3 chunks/s at 192 kbps
+_CHUNK = 8192
+_CHUNKS_IN_BUFFER = max(1, int(BUFFER_SECS * _OUTPUT_BYTES_PER_SEC / _CHUNK))
+log.info("Ring buffer: BUFFER_SECS=%.1f  maxlen=%d chunks (~%.1f KB)  rate=%d kbps",
+         BUFFER_SECS, _CHUNKS_IN_BUFFER, _CHUNKS_IN_BUFFER * _CHUNK / 1024,
+         _OUTPUT_BITRATE_KBPS)
+
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
 
 client_queues: list[asyncio.Queue] = []
+broadcaster_buffer: collections.deque[bytes] = collections.deque(maxlen=_CHUNKS_IN_BUFFER)
+_conn_id_counter = itertools.count(1)   # monotonic per-connection ID for log correlation
 client_count: int = 0
 client_lock: asyncio.Lock  # initialised in on_startup (needs running loop)
 
@@ -164,6 +181,7 @@ def broadcaster(loop: asyncio.AbstractEventLoop) -> None:
     assert ffmpeg_proc.stdout is not None
     log.info("Broadcaster started")
     while True:
+        read_start = time.monotonic()
         try:
             chunk = ffmpeg_proc.stdout.read(8192)
         except Exception as exc:
@@ -171,13 +189,28 @@ def broadcaster(loop: asyncio.AbstractEventLoop) -> None:
             break
         if not chunk:
             log.info("Broadcaster: ffmpeg stdout EOF — sending sentinel to all queues")
+            log.info("Broadcaster: clearing ring buffer (%d chunks)", len(broadcaster_buffer))
+            broadcaster_buffer.clear()
             snapshot = list(client_queues)
             for q in snapshot:
                 loop.call_soon_threadsafe(_safe_sentinel, q)
             break
+        broadcaster_buffer.append(chunk)
+        buf_len = len(broadcaster_buffer)
+        if buf_len % 30 == 0:   # log roughly every ~10 s
+            log.debug("Broadcaster: buffer fill %d/%d chunks, %d client(s)",
+                      buf_len, _CHUNKS_IN_BUFFER, len(client_queues))
         snapshot = list(client_queues)
         for q in snapshot:
             loop.call_soon_threadsafe(_safe_put, q, chunk)
+
+        # Rate-limit: each chunk represents (len/rate) seconds of audio.
+        # If we got here faster (fast ffmpeg), sleep the remainder.
+        # If ffmpeg was slow / blocked (paused), elapsed > chunk_secs → no sleep.
+        chunk_secs = len(chunk) / _OUTPUT_BYTES_PER_SEC
+        elapsed = time.monotonic() - read_start
+        if chunk_secs > elapsed:
+            time.sleep(chunk_secs - elapsed)
     log.info("Broadcaster exited")
 
 
@@ -322,13 +355,74 @@ async def playback_watchdog() -> None:
 async def handle_stream(request: web.Request) -> web.StreamResponse:
     global client_count, watchdog_task
 
-    # Register client
+    conn_id = next(_conn_id_counter)
+    ua = request.headers.get("User-Agent", "-")
+    range_hdr = request.headers.get("Range", "-")
+    is_probe = "Range" in request.headers
+    log.info("[conn=%d] Incoming %s /stream  addr=%s  probe=%s  Range=%s  User-Agent=%s",
+             conn_id, request.method, request.remote, is_probe, range_hdr, ua)
+
+    if is_probe:
+        # VLC (and some other players) sends a Range: bytes=0- probe first to check
+        # whether the server supports seeking.  We don't — respond with Accept-Ranges: none
+        # and stream without registering as a real client so the probe doesn't affect
+        # client_count, first_client logic, or the ring-buffer pre-fill.
+        log.info("[conn=%d] probe (Range present) — serving without registration", conn_id)
+        response = web.StreamResponse(headers={
+            "Content-Type": "audio/mpeg",
+            "Cache-Control": "no-cache",
+            "Accept-Ranges": "none",
+            "X-Content-Type-Options": "nosniff",
+            "icy-name": "Spotistream",
+            "icy-genre": "Music",
+        })
+        if request.version >= (1, 1):
+            response.enable_chunked_encoding()
+        await response.prepare(request)
+        # VLC closes this connection immediately after reading headers; just drain quietly.
+        probe_q: asyncio.Queue = asyncio.Queue(maxsize=8)
+        async with client_lock:
+            client_queues.append(probe_q)
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(probe_q.get(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    break
+                if chunk is None:
+                    break
+                try:
+                    await response.write(chunk)
+                except Exception:
+                    break
+        finally:
+            async with client_lock:
+                try:
+                    client_queues.remove(probe_q)
+                except ValueError:
+                    pass
+            log.info("[conn=%d] probe disconnected", conn_id)
+        return response
+
+    # Register real client
     async with client_lock:
         client_count += 1
         first_client = (client_count == 1)
-        queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=400)
+        buf_snapshot = list(broadcaster_buffer)
+        prefilled = 0
+        for chunk in buf_snapshot:
+            try:
+                queue.put_nowait(chunk)
+                prefilled += 1
+            except asyncio.QueueFull:
+                log.warning("[conn=%d] queue full during pre-fill after %d/%d chunks",
+                            conn_id, prefilled, len(buf_snapshot))
+                break
         client_queues.append(queue)
-        log.info("Client connected (total=%d, addr=%s)", client_count, request.remote)
+        log.info("[conn=%d] registered (total=%d, first=%s) — pre-filled %d/%d buffer chunks (%.1f KB)",
+                 conn_id, client_count, first_client, prefilled, len(buf_snapshot),
+                 prefilled * _CHUNK / 1024)
 
     if first_client:
         offset = random.randint(0, max(0, playlist_total - 1))
@@ -350,6 +444,7 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     response = web.StreamResponse(headers={
         "Content-Type": "audio/mpeg",
         "Cache-Control": "no-cache",
+        "Accept-Ranges": "none",
         "X-Content-Type-Options": "nosniff",
         "icy-name": "Spotistream",
         "icy-genre": "Music",
@@ -363,14 +458,15 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
             try:
                 chunk = await asyncio.wait_for(queue.get(), timeout=30.0)
             except asyncio.TimeoutError:
-                log.warning("Client %s timed out (no data for 30s)", request.remote)
+                log.warning("[conn=%d] timed out (no data for 30s, addr=%s)", conn_id, request.remote)
                 break
             if chunk is None:
-                log.info("Client %s received EOF sentinel", request.remote)
+                log.info("[conn=%d] received EOF sentinel", conn_id)
                 break
             try:
                 await response.write(chunk)
-            except Exception:
+            except Exception as exc:
+                log.info("[conn=%d] write error: %s", conn_id, exc)
                 break
     finally:
         async with client_lock:
@@ -380,7 +476,8 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
                 pass
             client_count -= 1
             last_client = (client_count == 0)
-            log.info("Client disconnected (total=%d, addr=%s)", client_count, request.remote)
+            log.info("[conn=%d] disconnected (total=%d, last=%s, addr=%s)",
+                     conn_id, client_count, last_client, request.remote)
 
         if last_client:
             if watchdog_task is not None:

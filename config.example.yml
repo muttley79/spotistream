@@ -17,6 +17,7 @@ ffmpeg:
 
 server:
   port: 8000
+  buffer_secs: 10   # seconds of audio pre-buffered for clients joining mid-session (default 10)
 
 logging:
   log_file: spotistream.log   # path to log file (relative = next to stream.py)
