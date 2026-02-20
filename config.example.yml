@@ -1,0 +1,19 @@
+spotify:
+  client_id: YOUR_CLIENT_ID
+  client_secret: YOUR_CLIENT_SECRET
+  refresh_token: ""             # written by auth_setup.py
+  playlist_id: YOUR_PLAYLIST_ID  # e.g. 37i9dQZF1DXcBWIGoYBM5M
+
+librespot:
+  device_name: Spotistream
+  cache_dir: /home/pi/.cache/librespot
+  bitrate: 320
+  username: ""                  # optional, helps librespot find right cache entry
+  path: ""                      # optional: full path to librespot binary
+  initial_volume: 100           # 0-100, default 100
+
+ffmpeg:
+  path: ""                      # optional: full path to ffmpeg binary
+
+server:
+  port: 8000
