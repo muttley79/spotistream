@@ -27,6 +27,7 @@ Usage:
 
 import asyncio
 import logging
+import logging.handlers
 import os
 import random
 import subprocess
@@ -70,6 +71,21 @@ LIBRESPOT_BIN: str    = LB_CFG.get("path", "") or "librespot"
 FFMPEG_BIN: str       = FF_CFG.get("path", "") or "ffmpeg"
 INITIAL_VOLUME: int   = int(LB_CFG.get("initial_volume", 100))
 SCOPES = "user-modify-playback-state user-read-playback-state streaming"
+
+
+def _add_file_handler() -> None:
+    log_cfg = CFG.get("logging", {})
+    log_file = log_cfg.get("log_file", "spotistream.log")
+    max_bytes = int(log_cfg.get("max_bytes", 10 * 1024 * 1024))  # 10 MB default
+    backup_count = int(log_cfg.get("backup_count", 3))
+    fh = logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+    )
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S"))
+    logging.getLogger().addHandler(fh)
+    log.info("File logging enabled: %s (max %dMB x %d)", log_file, max_bytes // 1024 // 1024, backup_count)
+
+_add_file_handler()
 
 # ---------------------------------------------------------------------------
 # Global state
@@ -260,21 +276,28 @@ async def sp_pause() -> None:
 async def playback_watchdog() -> None:
     """
     Asyncio task, runs only while clients are connected.
-    Polls current_playback(); if not playing, restarts playlist from track 0
-    (handles end-of-playlist).
+    Polls current_playback(); if not playing for 2 consecutive polls, restarts
+    playlist from track 0 (handles end-of-playlist). The debounce avoids false
+    positives during the brief gap between tracks.
     """
     log.info("Watchdog started")
     backoff = 5.0
+    not_playing_streak = 0
     while True:
         await asyncio.sleep(backoff)
         try:
             playback = await sp_call(sp.current_playback)
             if playback is None or not playback.get("is_playing"):
-                log.info("Watchdog: playback stopped — restarting playlist from track 0")
-                await start_playlist_at_offset(0)
-                backoff = 5.0
+                not_playing_streak += 1
+                if not_playing_streak >= 2:
+                    log.info("Watchdog: playback stopped (confirmed) — restarting from track 0")
+                    await start_playlist_at_offset(0)
+                    not_playing_streak = 0
+                else:
+                    log.debug("Watchdog: not playing (streak=%d, waiting to confirm)", not_playing_streak)
             else:
-                backoff = 5.0
+                not_playing_streak = 0
+            backoff = 5.0
         except spotipy.exceptions.SpotifyException as exc:
             if exc.http_status == 429:
                 retry_after = int(exc.headers.get("Retry-After", 10)) if exc.headers else 10
@@ -363,7 +386,9 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
             if watchdog_task is not None:
                 watchdog_task.cancel()
                 watchdog_task = None
-            await sp_pause()
+            async with client_lock:
+                if client_count == 0:
+                    await sp_pause()
 
     return response
 

@@ -17,3 +17,8 @@ ffmpeg:
 
 server:
   port: 8000
+
+logging:
+  log_file: spotistream.log   # path to log file (relative = next to stream.py)
+  max_bytes: 10485760         # 10 MB per rotated file (default)
+  backup_count: 3             # number of old files to keep (default)
