@@ -26,7 +26,9 @@ Usage:
 """
 
 import asyncio
+import base64
 import collections
+import glob
 import itertools
 import logging
 import logging.handlers
@@ -75,6 +77,38 @@ FFMPEG_BIN: str       = FF_CFG.get("path", "") or "ffmpeg"
 INITIAL_VOLUME: int   = int(LB_CFG.get("initial_volume", 100))
 SCOPES = "user-modify-playback-state user-read-playback-state streaming"
 BUFFER_SECS: float = float(SRV_CFG.get("buffer_secs", 10.0))
+PROMOS_DIR: str = SRV_CFG.get("promos_dir", "")
+AUTH_USER: str = SRV_CFG.get("auth_user", "")
+AUTH_PASS: str = SRV_CFG.get("auth_password", "")
+AUTH_ENABLED: bool = bool(AUTH_USER and AUTH_PASS)
+
+if AUTH_ENABLED:
+    log.info("Stream auth enabled (user='%s')", AUTH_USER)
+else:
+    log.info("Stream auth disabled (no auth_user/auth_password set)")
+
+
+def _check_auth(request) -> bool:
+    """Return True if the request carries valid Basic Auth credentials (or auth is disabled)."""
+    if not AUTH_ENABLED:
+        return True
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
+        user, _, password = decoded.partition(":")
+        return user == AUTH_USER and password == AUTH_PASS
+    except Exception:
+        return False
+
+
+def _unauthorized() -> web.Response:
+    return web.Response(
+        status=401,
+        headers={"WWW-Authenticate": 'Basic realm="Spotistream"'},
+        text="Unauthorized",
+    )
 
 
 def _add_file_handler() -> None:
@@ -90,6 +124,19 @@ def _add_file_handler() -> None:
     log.info("File logging enabled: %s (max %dMB x %d)", log_file, max_bytes // 1024 // 1024, backup_count)
 
 _add_file_handler()
+
+
+def load_promo_files() -> list[str]:
+    if not PROMOS_DIR:
+        return []
+    if not os.path.isdir(PROMOS_DIR):
+        log.warning("Promos: directory '%s' not found — promos disabled", PROMOS_DIR)
+        return []
+    files = sorted(glob.glob(os.path.join(PROMOS_DIR, "*.mp3")))
+    log.info("Promos: found %d .mp3 file(s) in '%s'", len(files), PROMOS_DIR)
+    return files
+
+PROMO_FILES: list[str] = load_promo_files()
 
 # Must match the -b:a value in build_ffmpeg_cmd()
 _OUTPUT_BITRATE_KBPS: int = 192
@@ -228,6 +275,31 @@ def _safe_sentinel(q: asyncio.Queue) -> None:
         pass
 
 
+def inject_promo(loop: asyncio.AbstractEventLoop, path: str) -> None:
+    """
+    Read a promo MP3 file and inject it into the live stream.
+    Runs in a thread executor while Spotify is paused (broadcaster is blocked).
+    Rate-limited identically to the broadcaster: one chunk_secs sleep per chunk.
+    Promo files should be 192 kbps MP3 to match _OUTPUT_BYTES_PER_SEC.
+    """
+    log.info("Promo: injecting '%s'", path)
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(_CHUNK)
+                if not chunk:
+                    break
+                broadcaster_buffer.append(chunk)
+                snapshot = list(client_queues)
+                for q in snapshot:
+                    loop.call_soon_threadsafe(_safe_put, q, chunk)
+                chunk_secs = len(chunk) / _OUTPUT_BYTES_PER_SEC
+                time.sleep(chunk_secs)
+    except Exception as exc:
+        log.error("Promo: error injecting '%s': %s", path, exc)
+    log.info("Promo: done")
+
+
 # ---------------------------------------------------------------------------
 # Spotipy helpers
 # ---------------------------------------------------------------------------
@@ -316,6 +388,9 @@ async def playback_watchdog() -> None:
     log.info("Watchdog started")
     backoff = 5.0
     not_playing_streak = 0
+    last_track_uri: str | None = None
+    songs_played: int = 0
+    next_promo_at: int = random.randint(3, 5)
     while True:
         await asyncio.sleep(backoff)
         try:
@@ -326,10 +401,36 @@ async def playback_watchdog() -> None:
                     log.info("Watchdog: playback stopped (confirmed) — restarting from track 0")
                     await start_playlist_at_offset(0)
                     not_playing_streak = 0
+                    last_track_uri = None   # reset so next song isn't double-counted
                 else:
                     log.debug("Watchdog: not playing (streak=%d, waiting to confirm)", not_playing_streak)
             else:
                 not_playing_streak = 0
+                if PROMO_FILES and client_count > 0:
+                    current_uri = (playback.get("item") or {}).get("uri")
+                    if current_uri and current_uri != last_track_uri:
+                        if last_track_uri is not None:   # skip counter on very first song
+                            songs_played += 1
+                            log.debug("Watchdog: song transition (%d played, promo at %d)",
+                                      songs_played, next_promo_at)
+                            if songs_played >= next_promo_at:
+                                songs_played = 0
+                                next_promo_at = random.randint(3, 5)
+                                promo_path = random.choice(PROMO_FILES)
+                                log.info("Watchdog: promo time — pausing, injecting '%s'",
+                                         promo_path)
+                                await sp_pause()
+                                cur_loop = asyncio.get_running_loop()
+                                await cur_loop.run_in_executor(
+                                    None, inject_promo, cur_loop, promo_path
+                                )
+                                try:
+                                    await sp_call(sp.start_playback,
+                                                  device_id=librespot_device_id)
+                                    log.info("Watchdog: promo done, Spotify resumed")
+                                except Exception as exc:
+                                    log.warning("Watchdog: resume after promo failed: %s", exc)
+                        last_track_uri = current_uri
             backoff = 5.0
         except spotipy.exceptions.SpotifyException as exc:
             if exc.http_status == 429:
@@ -353,6 +454,10 @@ async def playback_watchdog() -> None:
 # ---------------------------------------------------------------------------
 
 async def handle_stream(request: web.Request) -> web.StreamResponse:
+    if not _check_auth(request):
+        log.warning("Auth failure from %s", request.remote)
+        return _unauthorized()
+
     global client_count, watchdog_task
 
     conn_id = next(_conn_id_counter)

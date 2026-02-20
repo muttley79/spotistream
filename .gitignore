@@ -1,3 +1,4 @@
 config.yml
 temp
 spotistream.log
+spotistream.pid

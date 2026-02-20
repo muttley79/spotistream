@@ -18,6 +18,9 @@ ffmpeg:
 server:
   port: 8000
   buffer_secs: 10   # seconds of audio pre-buffered for clients joining mid-session (default 10)
+  promos_dir: ""    # optional: path to folder of .mp3 promo files (injected every 3-5 songs)
+  auth_user: ""     # optional: Basic Auth username (leave blank to disable)
+  auth_password: "" # optional: Basic Auth password
 
 logging:
   log_file: spotistream.log   # path to log file (relative = next to stream.py)

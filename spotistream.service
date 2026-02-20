@@ -1,0 +1,17 @@
+[Unit]
+Description=Spotistream — Spotify playlist HTTP streaming server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/scripts/spotistream
+ExecStart=/home/pi/scripts/spotistream/.venv/bin/python stream.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
