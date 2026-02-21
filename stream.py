@@ -591,6 +591,8 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
             async with client_lock:
                 if client_count == 0:
                     await sp_pause()
+                    broadcaster_buffer.clear()
+                    log.info("Ring buffer cleared on last-client disconnect")
 
     return response
 
