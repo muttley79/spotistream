@@ -533,7 +533,7 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
         offset = random.randint(0, max(0, playlist_total - 1))
         try:
             result = await sp_call(
-                sp.playlist_tracks,
+                sp.playlist_items,
                 PLAYLIST_ID,
                 offset=offset,
                 limit=1,
@@ -657,7 +657,7 @@ async def on_startup(app: web.Application) -> None:
 
     # Fetch playlist track count
     result = await sp_call(
-        sp.playlist_tracks,
+        sp.playlist_items,
         PLAYLIST_ID,
         fields="total",
         limit=1,
