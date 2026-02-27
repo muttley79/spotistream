@@ -533,13 +533,13 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
         offset = random.randint(0, max(0, playlist_total - 1))
         try:
             result = await sp_call(
-                sp.playlist_items,
-                PLAYLIST_ID,
+                sp._get,
+                f"playlists/{PLAYLIST_ID}/items",
                 offset=offset,
                 limit=1,
-                fields="items(track(duration_ms))",
+                fields="items(item(duration_ms))",
             )
-            duration_ms = result["items"][0]["track"]["duration_ms"]
+            duration_ms = result["items"][0]["item"]["duration_ms"]
             position_ms = random.randint(0, duration_ms // 2)
             await start_playlist_at_offset(offset, position_ms=position_ms)
         except Exception as exc:
@@ -657,8 +657,8 @@ async def on_startup(app: web.Application) -> None:
 
     # Fetch playlist track count
     result = await sp_call(
-        sp.playlist_items,
-        PLAYLIST_ID,
+        sp._get,
+        f"playlists/{PLAYLIST_ID}/items",
         fields="total",
         limit=1,
     )
