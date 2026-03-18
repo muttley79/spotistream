@@ -160,6 +160,7 @@ client_count: int = 0
 client_lock: asyncio.Lock  # initialised in on_startup (needs running loop)
 
 watchdog_task: asyncio.Task | None = None
+process_monitor_task: asyncio.Task | None = None
 
 sp: spotipy.Spotify  # initialised in on_startup
 librespot_device_id: str  # discovered in on_startup
@@ -219,18 +220,18 @@ def drain_stderr(proc: subprocess.Popen, name: str) -> None:
 # Broadcaster thread
 # ---------------------------------------------------------------------------
 
-def broadcaster(loop: asyncio.AbstractEventLoop) -> None:
+def broadcaster(loop: asyncio.AbstractEventLoop, ffmpeg_stdout) -> None:
     """
     Read MP3 chunks from ffmpeg stdout and fan-out to all client queues.
     Blocks naturally when librespot is paused (no PCM data flowing).
     Runs as a daemon thread.
     """
-    assert ffmpeg_proc.stdout is not None
+    assert ffmpeg_stdout is not None
     log.info("Broadcaster started")
     while True:
         read_start = time.monotonic()
         try:
-            chunk = ffmpeg_proc.stdout.read(8192)
+            chunk = ffmpeg_stdout.read(8192)
         except Exception as exc:
             log.error("Broadcaster read error: %s", exc)
             break
@@ -336,7 +337,7 @@ async def sp_call(fn, *args, **kwargs):
     return await loop.run_in_executor(None, partial(fn, *args, **kwargs))
 
 
-async def discover_device(timeout: float = 30.0) -> str:
+async def discover_device(timeout: float = 30.0, exit_on_timeout: bool = True) -> str:
     """Poll sp.devices() until the librespot device appears."""
     log.info("Waiting for librespot device '%s' to appear (up to %.0fs)...", DEVICE_NAME, timeout)
     deadline = asyncio.get_event_loop().time() + timeout
@@ -351,7 +352,9 @@ async def discover_device(timeout: float = 30.0) -> str:
             log.warning("devices() error: %s", exc)
         if asyncio.get_event_loop().time() >= deadline:
             log.error("Timed out waiting for librespot device. Is librespot running?")
-            sys.exit(1)
+            if exit_on_timeout:
+                sys.exit(1)
+            raise RuntimeError("Timed out waiting for librespot device")
         await asyncio.sleep(2)
 
 
@@ -605,9 +608,58 @@ async def handle_health(request: web.Request) -> web.Response:
 # App lifecycle
 # ---------------------------------------------------------------------------
 
+async def restart_pipeline(loop) -> None:
+    global librespot_proc, ffmpeg_proc, librespot_device_id
+    log.info("restart_pipeline: tearing down old processes")
+    for proc, name in [(ffmpeg_proc, "ffmpeg"), (librespot_proc, "librespot")]:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+            proc.wait(timeout=5)
+        except Exception as exc:
+            log.warning("restart_pipeline: error stopping %s: %s", name, exc)
+    lb_cmd = build_librespot_cmd()
+    log.info("restart_pipeline: starting librespot: %s", " ".join(lb_cmd))
+    librespot_proc = subprocess.Popen(lb_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    ff_cmd = build_ffmpeg_cmd()
+    log.info("restart_pipeline: starting ffmpeg: %s", " ".join(ff_cmd))
+    ffmpeg_proc = subprocess.Popen(ff_cmd, stdin=librespot_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    librespot_proc.stdout.close()
+    threading.Thread(target=drain_stderr, args=(librespot_proc, "librespot"), daemon=True).start()
+    threading.Thread(target=drain_stderr, args=(ffmpeg_proc, "ffmpeg"), daemon=True).start()
+    threading.Thread(target=broadcaster, args=(loop, ffmpeg_proc.stdout), daemon=True).start()
+    try:
+        librespot_device_id = await discover_device(timeout=30.0, exit_on_timeout=False)
+    except RuntimeError as exc:
+        log.error("restart_pipeline: device discovery failed: %s", exc)
+        return
+    if client_count > 0:
+        try:
+            await sp_call(sp.start_playback, device_id=librespot_device_id)
+        except Exception as exc:
+            log.warning("restart_pipeline: resume playback failed: %s", exc)
+    log.info("restart_pipeline: done — new device_id=%s", librespot_device_id)
+
+
+async def process_monitor(loop) -> None:
+    log.info("Process monitor started")
+    while True:
+        try:
+            await asyncio.sleep(5)
+            if librespot_proc.poll() is not None:
+                log.warning("Process monitor: librespot exited (code=%s) — restarting pipeline",
+                            librespot_proc.returncode)
+                await restart_pipeline(loop)
+        except asyncio.CancelledError:
+            log.info("Process monitor cancelled")
+            return
+        except Exception as exc:
+            log.error("Process monitor: unexpected error: %s", exc)
+
+
 async def on_startup(app: web.Application) -> None:
     global sp, librespot_device_id, playlist_total
-    global librespot_proc, ffmpeg_proc, client_lock
+    global librespot_proc, ffmpeg_proc, client_lock, process_monitor_task
 
     client_lock = asyncio.Lock()
     loop = asyncio.get_running_loop()
@@ -646,7 +698,7 @@ async def on_startup(app: web.Application) -> None:
 
     # Start broadcaster
     threading.Thread(
-        target=broadcaster, args=(loop,), daemon=True
+        target=broadcaster, args=(loop, ffmpeg_proc.stdout), daemon=True
     ).start()
 
     # Build spotipy client
@@ -665,6 +717,8 @@ async def on_startup(app: web.Application) -> None:
     playlist_total = result["total"]
     log.info("Playlist '%s' has %d tracks", PLAYLIST_ID, playlist_total)
 
+    process_monitor_task = asyncio.create_task(process_monitor(loop))
+
     log.info("Spotistream ready on port %d — waiting for first client", PORT)
 
 
@@ -672,6 +726,8 @@ async def on_cleanup(app: web.Application) -> None:
     log.info("Shutting down...")
     if watchdog_task is not None:
         watchdog_task.cancel()
+    if process_monitor_task is not None:
+        process_monitor_task.cancel()
     for proc, name in [(ffmpeg_proc, "ffmpeg"), (librespot_proc, "librespot")]:
         try:
             proc.terminate()
