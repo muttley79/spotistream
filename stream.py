@@ -441,6 +441,10 @@ async def playback_watchdog() -> None:
                 wait = min(retry_after, 60)
                 log.warning("Watchdog: 429 rate-limited, backing off %ds", wait)
                 backoff = wait
+            elif exc.http_status == 404 and "Device not found" in str(exc):
+                log.warning("Watchdog: device not found (404) — restarting pipeline")
+                await restart_pipeline(asyncio.get_running_loop())
+                backoff = 5.0
             else:
                 log.warning("Watchdog spotipy error: %s", exc)
                 backoff = min(backoff * 2, 60)

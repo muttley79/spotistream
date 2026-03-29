@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/scripts/spotistream
-ExecStart=/home/pi/scripts/spotistream/.venv/bin/python stream.py
+User=arnonsegal
+WorkingDirectory=/home/arnonsegal/scripts/spotistream
+ExecStart=/home/arnonsegal/scripts/spotistream/.venv/bin/python stream.py
 Restart=on-failure
 RestartSec=5
 StandardOutput=null
