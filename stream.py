@@ -654,6 +654,10 @@ async def process_monitor(loop) -> None:
                 log.warning("Process monitor: librespot exited (code=%s) — restarting pipeline",
                             librespot_proc.returncode)
                 await restart_pipeline(loop)
+            elif ffmpeg_proc.poll() is not None:
+                log.warning("Process monitor: ffmpeg exited (code=%s) — restarting pipeline",
+                            ffmpeg_proc.returncode)
+                await restart_pipeline(loop)
         except asyncio.CancelledError:
             log.info("Process monitor cancelled")
             return
