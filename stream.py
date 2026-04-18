@@ -441,8 +441,8 @@ async def playback_watchdog() -> None:
                 wait = min(retry_after, 60)
                 log.warning("Watchdog: 429 rate-limited, backing off %ds", wait)
                 backoff = wait
-            elif exc.http_status == 404 and "Device not found" in str(exc):
-                log.warning("Watchdog: device not found (404) — restarting pipeline")
+            elif exc.http_status == 404:
+                log.warning("Watchdog: 404 from Spotify (%s) — restarting pipeline", exc.reason)
                 await restart_pipeline(asyncio.get_running_loop())
                 backoff = 5.0
             else:
@@ -549,6 +549,12 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
             duration_ms = result["items"][0]["item"]["duration_ms"]
             position_ms = random.randint(0, duration_ms // 2)
             await start_playlist_at_offset(offset, position_ms=position_ms)
+        except spotipy.exceptions.SpotifyException as exc:
+            if exc.http_status == 404:
+                log.warning("First-client start_playback: 404 (%s) — restarting pipeline", exc.reason)
+                await restart_pipeline(asyncio.get_running_loop())
+            else:
+                log.error("Failed to start playback: %s", exc)
         except Exception as exc:
             log.error("Failed to start playback: %s", exc)
         watchdog_task = asyncio.create_task(playback_watchdog())
