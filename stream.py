@@ -536,42 +536,42 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
                  conn_id, client_count, first_client, prefilled, len(buf_snapshot),
                  prefilled * _CHUNK / 1024)
 
-    if first_client:
-        offset = random.randint(0, max(0, playlist_total - 1))
-        try:
-            result = await sp_call(
-                sp._get,
-                f"playlists/{PLAYLIST_ID}/items",
-                offset=offset,
-                limit=1,
-                fields="items(item(duration_ms))",
-            )
-            duration_ms = result["items"][0]["item"]["duration_ms"]
-            position_ms = random.randint(0, duration_ms // 2)
-            await start_playlist_at_offset(offset, position_ms=position_ms)
-        except spotipy.exceptions.SpotifyException as exc:
-            if exc.http_status == 404:
-                log.warning("First-client start_playback: 404 (%s) — restarting pipeline", exc.reason)
-                await restart_pipeline(asyncio.get_running_loop())
-            else:
-                log.error("Failed to start playback: %s", exc)
-        except Exception as exc:
-            log.error("Failed to start playback: %s", exc)
-        watchdog_task = asyncio.create_task(playback_watchdog())
-
-    response = web.StreamResponse(headers={
-        "Content-Type": "audio/mpeg",
-        "Cache-Control": "no-cache",
-        "Accept-Ranges": "none",
-        "X-Content-Type-Options": "nosniff",
-        "icy-name": "Spotistream",
-        "icy-genre": "Music",
-    })
-    if request.version >= (1, 1):
-        response.enable_chunked_encoding()
-    await response.prepare(request)
-
     try:
+        if first_client:
+            offset = random.randint(0, max(0, playlist_total - 1))
+            try:
+                result = await sp_call(
+                    sp._get,
+                    f"playlists/{PLAYLIST_ID}/items",
+                    offset=offset,
+                    limit=1,
+                    fields="items(item(duration_ms))",
+                )
+                duration_ms = result["items"][0]["item"]["duration_ms"]
+                position_ms = random.randint(0, duration_ms // 2)
+                await start_playlist_at_offset(offset, position_ms=position_ms)
+            except spotipy.exceptions.SpotifyException as exc:
+                if exc.http_status == 404:
+                    log.warning("First-client start_playback: 404 (%s) — restarting pipeline", exc.reason)
+                    await restart_pipeline(asyncio.get_running_loop())
+                else:
+                    log.error("Failed to start playback: %s", exc)
+            except Exception as exc:
+                log.error("Failed to start playback: %s", exc)
+            watchdog_task = asyncio.create_task(playback_watchdog())
+
+        response = web.StreamResponse(headers={
+            "Content-Type": "audio/mpeg",
+            "Cache-Control": "no-cache",
+            "Accept-Ranges": "none",
+            "X-Content-Type-Options": "nosniff",
+            "icy-name": "Spotistream",
+            "icy-genre": "Music",
+        })
+        if request.version >= (1, 1):
+            response.enable_chunked_encoding()
+        await response.prepare(request)
+
         while True:
             try:
                 chunk = await asyncio.wait_for(queue.get(), timeout=30.0)
