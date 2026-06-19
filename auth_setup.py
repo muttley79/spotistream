@@ -136,6 +136,7 @@ def main() -> None:
 
     cfg["spotify"]["refresh_token"] = refresh_token
     cfg["spotify"]["refresh_token_created_at"] = datetime.date.today().isoformat()
+    cfg["spotify"]["refresh_token_warning_sent"] = False
     save_config(cfg)
     print(f"\nrefresh_token saved to config.yml (expires in ~6 months)")
 

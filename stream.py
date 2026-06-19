@@ -162,6 +162,7 @@ client_lock: asyncio.Lock  # initialised in on_startup (needs running loop)
 
 watchdog_task: asyncio.Task | None = None
 process_monitor_task: asyncio.Task | None = None
+token_expiry_task: asyncio.Task | None = None
 
 sp: spotipy.Spotify  # initialised in on_startup
 librespot_device_id: str  # discovered in on_startup
@@ -308,6 +309,21 @@ def inject_promo(loop: asyncio.AbstractEventLoop, path: str) -> None:
 
 _REFRESH_TOKEN_LIFETIME_DAYS = 180
 _REFRESH_TOKEN_WARN_DAYS = 14
+_REFRESH_TOKEN_TELEGRAM_DAYS = 7
+NOTIFY_SCRIPT = "/home/arnonsegal/scripts/whatsapp/notify.sh"
+
+
+def _notify_telegram(message: str) -> None:
+    try:
+        subprocess.run([NOTIFY_SCRIPT, message], check=True, capture_output=True, timeout=15)
+    except Exception as exc:
+        log.warning("Failed to send Telegram notification: %s", exc)
+
+
+def _save_config() -> None:
+    path = os.environ.get("CONFIG", "config.yml")
+    with open(path, "w") as f:
+        yaml.dump(CFG, f, default_flow_style=False, allow_unicode=True)
 
 
 def _check_refresh_token_age() -> None:
@@ -332,6 +348,14 @@ def _check_refresh_token_age() -> None:
             days_left,
             created_str,
         )
+
+    if days_left <= _REFRESH_TOKEN_TELEGRAM_DAYS and not SP_CFG.get("refresh_token_warning_sent"):
+        _notify_telegram(
+            f"Spotistream: Spotify refresh token expires in {days_left} day(s). "
+            f"SSH into the Pi and run: python3 auth_setup.py"
+        )
+        SP_CFG["refresh_token_warning_sent"] = True
+        _save_config()
 
 
 def build_spotipy_client() -> spotipy.Spotify:
@@ -690,6 +714,16 @@ async def restart_pipeline(loop) -> None:
     log.info("restart_pipeline: done — new device_id=%s", librespot_device_id)
 
 
+async def token_expiry_watchdog() -> None:
+    """Daily check so the Telegram alert fires even if the service stays up for months."""
+    while True:
+        await asyncio.sleep(24 * 3600)
+        try:
+            _check_refresh_token_age()
+        except Exception as exc:
+            log.warning("token_expiry_watchdog error: %s", exc)
+
+
 async def process_monitor(loop) -> None:
     log.info("Process monitor started")
     while True:
@@ -712,7 +746,7 @@ async def process_monitor(loop) -> None:
 
 async def on_startup(app: web.Application) -> None:
     global sp, librespot_device_id, playlist_total
-    global librespot_proc, ffmpeg_proc, client_lock, process_monitor_task
+    global librespot_proc, ffmpeg_proc, client_lock, process_monitor_task, token_expiry_task
 
     client_lock = asyncio.Lock()
     loop = asyncio.get_running_loop()
@@ -771,6 +805,7 @@ async def on_startup(app: web.Application) -> None:
     log.info("Playlist '%s' has %d tracks", PLAYLIST_ID, playlist_total)
 
     process_monitor_task = asyncio.create_task(process_monitor(loop))
+    token_expiry_task = asyncio.create_task(token_expiry_watchdog())
 
     log.info("Spotistream ready on port %d — waiting for first client", PORT)
 
@@ -781,6 +816,8 @@ async def on_cleanup(app: web.Application) -> None:
         watchdog_task.cancel()
     if process_monitor_task is not None:
         process_monitor_task.cancel()
+    if token_expiry_task is not None:
+        token_expiry_task.cancel()
     for proc, name in [(ffmpeg_proc, "ffmpeg"), (librespot_proc, "librespot")]:
         try:
             proc.terminate()
