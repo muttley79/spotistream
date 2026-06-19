@@ -18,6 +18,7 @@ Usage:
   python3 auth_setup.py
 """
 
+import datetime
 import os
 import subprocess
 import sys
@@ -134,8 +135,9 @@ def main() -> None:
     access_token, refresh_token = run_oauth(cfg)
 
     cfg["spotify"]["refresh_token"] = refresh_token
+    cfg["spotify"]["refresh_token_created_at"] = datetime.date.today().isoformat()
     save_config(cfg)
-    print(f"\nrefresh_token saved to config.yml")
+    print(f"\nrefresh_token saved to config.yml (expires in ~6 months)")
 
     populate_librespot_cache(cfg, access_token)
 

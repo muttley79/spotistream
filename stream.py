@@ -28,6 +28,7 @@ Usage:
 import asyncio
 import base64
 import collections
+import datetime
 import glob
 import itertools
 import logging
@@ -305,11 +306,40 @@ def inject_promo(loop: asyncio.AbstractEventLoop, path: str) -> None:
 # Spotipy helpers
 # ---------------------------------------------------------------------------
 
+_REFRESH_TOKEN_LIFETIME_DAYS = 180
+_REFRESH_TOKEN_WARN_DAYS = 14
+
+
+def _check_refresh_token_age() -> None:
+    created_str = SP_CFG.get("refresh_token_created_at", "")
+    if not created_str:
+        return
+    try:
+        created = datetime.date.fromisoformat(created_str)
+    except ValueError:
+        return
+    days_left = _REFRESH_TOKEN_LIFETIME_DAYS - (datetime.date.today() - created).days
+    if days_left <= 0:
+        log.error(
+            "Spotify refresh token has expired (created %s). "
+            "SSH into this machine and run: python3 auth_setup.py",
+            created_str,
+        )
+    elif days_left <= _REFRESH_TOKEN_WARN_DAYS:
+        log.warning(
+            "Spotify refresh token expires in %d day(s) (created %s). "
+            "SSH into this machine and run: python3 auth_setup.py",
+            days_left,
+            created_str,
+        )
+
+
 def build_spotipy_client() -> spotipy.Spotify:
     refresh_token = SP_CFG.get("refresh_token", "")
     if not refresh_token:
         log.error("No refresh_token in config.yml. Run auth_setup.py first.")
         sys.exit(1)
+    _check_refresh_token_age()
 
     cache_handler = spotipy.cache_handler.MemoryCacheHandler(token_info={
         "refresh_token": refresh_token,
@@ -334,7 +364,16 @@ def build_spotipy_client() -> spotipy.Spotify:
 async def sp_call(fn, *args, **kwargs):
     """Run a blocking spotipy call in the default executor."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, partial(fn, *args, **kwargs))
+    try:
+        return await loop.run_in_executor(None, partial(fn, *args, **kwargs))
+    except spotipy.oauth2.SpotifyOauthError as exc:
+        if "invalid_grant" in str(exc).lower():
+            log.error(
+                "Spotify refresh token expired. "
+                "SSH into this machine and run: python3 auth_setup.py"
+            )
+            sys.exit(1)
+        raise
 
 
 async def discover_device(timeout: float = 30.0, exit_on_timeout: bool = True) -> str:
