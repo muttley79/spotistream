@@ -1,3 +1,4 @@
 aiohttp==3.10.11
 spotipy==2.24.0
 PyYAML==6.0.2
+requests==2.32.5
